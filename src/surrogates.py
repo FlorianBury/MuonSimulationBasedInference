@@ -173,7 +173,6 @@ class LossSurrogate(nn.Module):
             self.flow.train()
             train_losses = torch.zeros(len(train_loader))
             for batch_idx, (obs,cond) in tqdm(enumerate(train_loader),desc='Training',leave=False,total=len(train_loader)):
-                print( batch_idx, self.device )
                 # Move to device #
                 obs = obs.to(self.device)
                 cond = cond.to(self.device)
@@ -378,8 +377,8 @@ class LossSurrogate(nn.Module):
                 samp = self.flow.sample(
                     n_samples = n_samples,
                     context = cond,
-                )
-        samp = self.obs_prep.inverse(samp[:,0,:]).cpu()
+                ).permute(1,0,2)
+        samp = self.obs_prep.inverse(samp).cpu()
         return samp
 
 

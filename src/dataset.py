@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -45,7 +46,7 @@ class MuonDataset(Dataset):
                 di = self.di,
                 df = self.df,
             )
-            print (f'Masking {self.mask.numel()-sum(self.mask)} out of {self.mask.numel()} events [{(self.mask.numel()-sum(self.mask))/self.mask.numel()*100:5.3f}%]')
+            #print (f'Masking {self.mask.numel()-sum(self.mask)} out of {self.mask.numel()} events [{(self.mask.numel()-sum(self.mask))/self.mask.numel()*100:5.3f}%]')
         else:
             self.mask = torch.fill(self.ri.shape[0],fill_value=True)
 
@@ -68,16 +69,10 @@ class MuonDataset(Dataset):
             ],
             dim = -1,
         )
+        self.observables = self._observables[self.mask]
+        self.conditions = self._conditions[self.mask]
         self.observable_names = [r'$\Delta\theta_1$',r'$\Delta\theta_2$',r'$\Delta r_1$',r'$\Delta r_2$',]
         self.condition_names = ['x','y','z',r'$d_x$',r'$d_y$',r'$d_z$',r'$\log P$']
-
-    @property
-    def observables(self):
-        return self._observables[self.mask]
-
-    @property
-    def conditions(self):
-        return self._conditions[self.mask]
 
     @classmethod
     def from_data_file(
@@ -95,7 +90,7 @@ class MuonDataset(Dataset):
         di = torch.tensor(data[:, 3:6], dtype=torch.float32)
         rf = torch.tensor(data[:, 6:9], dtype=torch.float32)
         df = torch.tensor(data[:, 9:12], dtype=torch.float32)
-        df = - df
+        #df = - df
 
         return cls(
             ri = ri,
@@ -105,6 +100,28 @@ class MuonDataset(Dataset):
             pi = pi,
             selection = selection,
         )
+
+    def save(
+        self,
+        data_file,
+        momentum_file,
+        overwrite=False,
+    ):
+        if os.path.exists(data_file) and not overwrite:
+            raise RuntimeError(f'{data_file} already exists')
+        if os.path.exists(momentum_file) and not overwrite:
+            raise RuntimeError(f'{momentum_file} already exists')
+        data = np.concatenate(
+            [
+                self.ri,
+                self.di,
+                self.rf,
+                self.df,
+            ],
+            axis = -1,
+        )
+        np.save(data_file,data)
+        np.save(momentum_file,self.pi*1000) # MeV
 
     def get_observable_preprocessing(self):
         preprocessing = ObservablePreprocessing(c=1)
@@ -151,3 +168,17 @@ class MuonDataset(Dataset):
             seed = seed,
         )
 
+    def plot_observables(self,log=False):
+        fig = plt.figure()
+        plt.title('Observables')
+        for i,name in enumerate([r'$\Delta\theta_1$',r'$\Delta\theta_2$',r'$\Delta r_1$',r'$\Delta r_2$',]):
+            plt.hist(
+                self.observables[:,i],
+                bins = 100,
+                histtype = 'step',
+                label = name,
+            )
+        if log:
+            plt.yscale('log')
+        plt.legend()
+        return fig

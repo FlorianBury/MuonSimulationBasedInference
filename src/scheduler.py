@@ -19,13 +19,16 @@ class BaseScheduler:
         propagator,
         device = None,
         callbacks = [],
+        mapper_losses = [],
         n_samples = 1,
         batch_size = 1000,
+        scheduler_params = None,
     ):
         self.data_dataset = dataset
         self.mapper = mapper
         self.propagator = propagator
         self.callbacks = callbacks
+        self.mapper_losses = mapper_losses
         self.n_samples = n_samples
         self.batch_size = batch_size
 
@@ -33,8 +36,13 @@ class BaseScheduler:
         self.device = device
         if self.device is None:
             self.device = 'cpu'
-
         self.mapper.set_to_device(self.device)
+
+        if scheduler_params is None:
+            self.scheduler = None
+        else:
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.mapper.optimizer,**scheduler_params)
+
 
     def pre_train_mapper(self,sampling_function,loss_cutoff,batch_size,max_epochs=math.inf):
         loss = 1e10
@@ -96,6 +104,7 @@ class BaseScheduler:
                     ri = ri,
                     di = di,
                     pi = pi,
+                    idx = idx,
                 )
         else:
             rf, df, pf = self.propagator.propagate(
@@ -103,6 +112,7 @@ class BaseScheduler:
                 ri = ri,
                 di = di,
                 pi = pi,
+                idx = idx,
             )
         ri = ri.reshape(batch_size,self.n_samples,-1)
         di = di.reshape(batch_size,self.n_samples,-1)
@@ -141,7 +151,7 @@ class BaseScheduler:
         for callback in self.callbacks:
             callback.on_optimisation_start(self.mapper)
         for it in range(n_iterations):
-            print (f'Iteration {it+1}/{n_iterations} [{(it+1)/n_iterations*100:5.2f}]%')
+            print(f"Iteration {it+1}/{n_iterations} [{(it+1)/n_iterations*100:5.2f}]% - LR = {self.mapper.lr:.3e}")
             # Pre-step #
             self._pre_step()
             # Propagate muons with gradient #
@@ -154,17 +164,45 @@ class BaseScheduler:
                     obs_names = self.data_dataset.observable_names,
                 )
             # Calculate loss #
-            loss = self._loss(it,sim_datasets,idx)
-            print (f'Loss = {loss:.5f}')
+            losses = self._loss(it,sim_datasets,idx)
+            losses.update(
+                {
+                    mapper_loss.name : mapper_loss(self.mapper)
+                    for mapper_loss in self.mapper_losses
+                }
+            )
+            loss_tot = sum(losses.values())
+            s = f'Loss : {loss_tot:7.5f} ='
+            for name,loss in losses.items():
+                s += f' + {loss:7.5f} ({name})'
+            print (s)
+            for callback in self.callbacks:
+                callback.on_losses_end(
+                    iteration = it,
+                    lr = self.mapper.lr,
+                    losses = {
+                        'Total ' : loss_tot.item(),
+                        **{
+                            name : loss.item()
+                            for name,loss in losses.items()
+                        },
+                    },
+                )
             # Perform gradient step #
+            checker = ModelParameterChecker(self.mapper)
             self.mapper.train()
-            self.mapper.optimize(loss)
+            self.mapper.optimize(loss_tot)
+            print(f"Voxel Min: {self.mapper.voxels.min().item():.4f} | Max: {self.mapper.voxels.max().item():.4f}")
+            if checker.has_changed():
+                print (checker.compare())
+            if self.scheduler is not None:
+                self.scheduler.step(loss_tot)
+            # Callbacks #
             for callback in self.callbacks:
                 callback.on_iteration_end(
                     iteration = it,
                     mapper = self.mapper,
                 )
-
         for callback in self.callbacks:
             callback.on_optimisation_end(self.mapper)
 
@@ -312,7 +350,7 @@ class EnergyDistanceScheduler(BaseScheduler):
         # Get propagated observables #
         samp_obs = torch.stack(
             [
-                sim_dataset.observables
+                sim_dataset._observables[sim_dataset.mask]
                 for sim_dataset in sim_datasets
             ],
             dim = 1,
@@ -327,64 +365,94 @@ class EnergyDistanceScheduler(BaseScheduler):
         else:
             true_obs = self.data_dataset.observables[idx].unsqueeze(1)
 
-        # Weight #
-        norms = torch.norm(samp_obs, dim=-1)
-        weights = 1.0 + self.gamma * (norms ** self.p) # Shape: (N, M)
-        # Attractive : samp vs true observables #
-        eps = 1e-8
-        diff_sq = ((samp_obs[:, :, None, :] - true_obs[:, None, :, :]) ** 2).sum(-1)
-        weighted_diff_sq = weights[:, None, :] * diff_sq
-        att = torch.sqrt(weighted_diff_sq + eps).mean((1, 2))
-        # Repulsive : samp vs samp observables #
-        rep = torch.sqrt(((samp_obs[:, :, None] - samp_obs[:, None]) ** 2).sum(-1) + eps)
-        K = self.n_samples
-        off = ~torch.eye(K, dtype=torch.bool, device=samp_obs.device)
-        rep = rep[:, off].sum(-1) / (K * (K - 1))
-        # Total loss #
-        tot_loss = (att - 0.5 * rep).mean()
-        # Callbacks #
+        att, rep = energy_distance_loss(
+            x = true_obs,
+            y = samp_obs,
+            gamma = self.gamma,
+            p = self.p,
+        )
+        losses = {
+            'Attraction' : att.mean(),
+            'Repulsion' : rep.mean(),
+        }
+        return losses
+
+
+class GaussianLikelihoodScheduler(BaseScheduler):
+    """Maximum-likelihood mapper optimisation on the data only (no simulator samples)."""
+
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        self.step_size = self.propagator.step_size
+        self._obs = None
+
+
+    def optimize_step(self, it):
+        idx = torch.randperm(len(self.data_dataset))[: self.batch_size]
+        mask = getattr(self.data_dataset, "mask", None)
+        if mask is not None:
+            idx = idx[mask[idx]]
+        ri, rf, pi, obs = [
+            t[idx].to(self.device)
+            for t in [
+                self.data_dataset.ri,
+                self.data_dataset.rf,
+                self.data_dataset.pi,
+                self.data_dataset._observables,
+            ]
+        ]
+
+        loss, q = gaussian_nll(self.mapper, ri, rf , pi, obs, self.step_size, jitter=True)
+        if not torch.isfinite(loss):
+            raise RuntimeError("non-finite likelihood: check lambda >= 0 and the track lengths")
+
+        pull = q.mean().item() / 2 # ~1 when the model is calibrated
+        #print(f"NLL = {loss.item():9.5f}   <q>/2 = {pull:6.3f}   ({q.shape[0]} muons)")
+        return loss
+
+    def optimize(self, n_iterations):
         for callback in self.callbacks:
-            callback.on_losses_end(
-                iteration = it,
-                losses = {
-                    'Attraction' : att.mean().item(),
-                    'Repulsion' : rep.mean().item(),
-                    'Loss' : tot_loss.item(),
-                },
-            )
-        return tot_loss
+            callback.on_optimisation_start(self.mapper)
+        for it in range(n_iterations):
+            print(f"Iteration {it+1}/{n_iterations} [{(it+1)/n_iterations*100:5.2f}]% - LR = {self.mapper.lr:.3e}")
+            loss = self.optimize_step(it)
+            extra_losses = {
+                mapper_loss.name : mapper_loss(self.mapper)
+                for mapper_loss in self.mapper_losses
+            }
+            loss_tot = loss + sum(extra_losses.values())
+            s = f'Loss : {loss_tot:.3f} = {loss:.3f} (Mapping)'
+            for name,extra_loss in extra_losses.items():
+                s += f' + {extra_loss:.3f} ({name})'
+            print (s)
+            self.mapper.train()
+            self.mapper.optimize(loss)
+            if self.scheduler is not None:
+                self.scheduler.step(loss_tot)
+            for callback in self.callbacks:
+                callback.on_losses_end(
+                    iteration = it,
+                    lr = self.mapper.lr,
+                    losses = {
+                        'Loss' : loss_tot.item(),
+                        'Mapping' : loss.item(),
+                        **{
+                            name : extra_loss.item()
+                            for name,extra_loss in extra_losses.items()
+                        }
+                    },
+                )
+            for callback in self.callbacks:
+                callback.on_iteration_end(
+                    iteration = it,
+                    mapper = self.mapper,
+                )
+
+        for callback in self.callbacks:
+            callback.on_optimisation_end(self.mapper)
 
 
-
-
-
-
-#        log_prob_sim = self.sim_surrogate.log_prob(
-#            obs = sim_dataset.observables,
-#            cond = sim_dataset.conditions,
-#        )
-#        log_prob_data = self.data_surrogate.log_prob(
-#            obs = sim_dataset.observables,
-#            cond = sim_dataset.conditions,
-#        )
-#        coverage = self.sim_surrogate.log_prob_dataset(
-#            dataset = self.data_surrogate.valid_dataset,
-#            batch_size = 5000,
-#        )
-#        for callback in self.callbacks:
-#            callback.on_surrogate_end(it,log_prob_sim.detach().cpu(),log_prob_data.detach().cpu())
-#        loss = (log_prob_sim-log_prob_data).mean()
-#        print (f'Loss = {log_prob_sim.mean().item():8.5f} (sim) - {log_prob_data.mean().item():8.5f} (data) = {loss.item():8.5f} (total)')
-#        for callback in self.callbacks:
-#            callback.on_losses_end(
-#                iteration = it,
-#                losses = {
-#                    r'Reverse $KL(p_{\psi}||q_{\phi})$' : loss.item(),
-#                    r'Forward $KL(q_{\phi}||p_{\psi})$' : (log_prob_final-coverage).mean().item(),
-#                    r'$E[\log q_{\phi}(x_{\theta})]$' : log_prob_data.mean().item(),
-#                    r'$E[\log p_{\psi}(x_{\theta})]$' : log_prob_sim.mean().item(),
-#                    r'$E[\log q_{\phi}(x_{data})]$' : log_prob_final.mean().item(),
-#                    r'$E[\log p_{\psi}(x_{data})]$' : coverage.mean().item(),
-#                },
-#            )
-#        return loss

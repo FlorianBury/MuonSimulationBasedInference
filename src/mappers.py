@@ -7,7 +7,7 @@ from tqdm.notebook import tqdm
 from torch.utils.data import DataLoader,Subset
 import matplotlib
 import matplotlib.pyplot as plt
-from matplotlib.ticker import ScalarFormatter
+from matplotlib.ticker import ScalarFormatter, FormatStrFormatter
 
 from tools import *
 from constants import *
@@ -51,6 +51,60 @@ class ModelParameterChecker:
     def save(self):
         """Update the snapshot to the current model parameters."""
         self.saved_params = self._snapshot()
+
+class BackgroundLoss(nn.Module):
+    def __init__(self, N, weight=1.0, target_density=0.0):
+        super().__init__()
+        self.N = N
+        self.weight = weight
+        self.target_density = target_density
+
+    @property
+    def name(self):
+        return 'Background'
+
+    def forward(self, mapper):
+        points = torch.rand(self.N, 3, device=mapper.device) * (mapper.xhigh - mapper.xlow) + mapper.xlow
+        preds = mapper(points)
+        loss = torch.abs(preds - self.target_density).mean()
+        return self.weight * loss
+
+class SmoothnessLoss(nn.Module):
+    def __init__(self, N, weight=1.0, eps=1e-3, p=1):
+        super().__init__()
+        self.N = N
+        self.weight = weight
+        self.eps = eps
+        self.p = p
+
+    @property
+    def name(self):
+        return 'Smoothness'
+
+    def forward(self, mapper):
+        points = torch.rand(self.N, 3, device=mapper.device) * (mapper.xhigh - mapper.xlow) + mapper.xlow
+        f_orig = mapper(points)
+
+        dx = torch.tensor([self.eps, 0.0, 0.0], device=points.device, dtype=points.dtype)
+        dy = torch.tensor([0.0, self.eps, 0.0], device=points.device, dtype=points.dtype)
+        dz = torch.tensor([0.0, 0.0, self.eps], device=points.device, dtype=points.dtype)
+
+        f_x = mapper(points + dx)
+        f_y = mapper(points + dy)
+        f_z = mapper(points + dz)
+
+        # 3. Compute absolute differences along each axis direction
+        diff_x = torch.abs(f_x - f_orig)
+        diff_y = torch.abs(f_y - f_orig)
+        diff_z = torch.abs(f_z - f_orig)
+
+        # 4. Combine differences (L1 or L2 norm)
+        if self.p == 1:
+            loss = (diff_x + diff_y + diff_z).mean()
+        else:
+            loss = ((diff_x ** 2) + (diff_y ** 2) + (diff_z ** 2)).mean()
+
+        return self.weight * loss
 
 class MLP(nn.Module):
     def __init__(
@@ -108,13 +162,14 @@ class BaseDensityMapper(nn.Module):
         ylow,
         yhigh,
         device = 'cpu',
+        accumulation = None,
     ):
         super().__init__()
 
         if not torch.is_tensor(xlow):
             xlow = torch.tensor(xlow)
         if not torch.is_tensor(xhigh):
-            xhigh = torch.tensor(high)
+            xhigh = torch.tensor(xhigh)
         self.register_buffer("xlow", xlow)
         self.register_buffer("xhigh", xhigh)
         if not torch.is_tensor(ylow):
@@ -124,11 +179,17 @@ class BaseDensityMapper(nn.Module):
         self.register_buffer("ylow", torch.log10(ylow))
         self.register_buffer("yhigh", torch.log10(yhigh))
 
+        self.accumulation = accumulation
+        self._counter = 0
         self.device = device
 
     def set_lr(self,lr):
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
+
+    @property
+    def lr(self):
+        return self.optimizer.param_groups[0]['lr']
 
     def set_to_device(self,device):
         self.device = device
@@ -154,16 +215,10 @@ class BaseDensityMapper(nn.Module):
             print (y[mask])
         return torch.pow(10,y)
 
-    def extra_loss(self):
-        return None
-
     def loss(self,x,t):
         t = torch.log10(t)
         t = 2 * (t - self.ylow) / (self.yhigh - self.ylow) - 1
         loss = (self(x)-t).square().mean()
-        extra_loss = self.extra_loss()
-        if extra_loss is not None:
-            loss = loss + extra_loss
         return loss
 
     def param_stats(self, top=10):
@@ -180,13 +235,26 @@ class BaseDensityMapper(nn.Module):
         total = torch.sqrt(sum((p.detach() ** 2).sum() for p in self.parameters()))
         print("total weight norm:", total.item())
 
-    def optimize(self,loss,max_norm=1.0):
-        self.optimizer.zero_grad()
+    def optimize(self, loss):
+        if self.accumulation is not None and self.accumulation > 1:
+            loss = loss / self.accumulation
         loss.backward()
         self.param_stats()
-        #grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm)
-        #print ('grad norm',grad_norm)
-        self.optimizer.step()
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+        self._counter += 1
+
+        if self.accumulation is None or (self._counter % self.accumulation == 0):
+            self.optimizer.step()
+            if self.raw_voxels.grad is not None:
+                print(f"Max gradient: {self.raw_voxels.grad.abs().max().item():.6e}")
+                grads = self.raw_voxels.grad
+                num_total = grads.numel()
+                num_nonzero = (grads != 0).sum().item()
+                print(f"Non-zero gradients: {num_nonzero} out of {num_total} voxels ({num_nonzero / num_total * 100:.2f}%)")
+                print(f"Mean gradient of active voxels: {grads[grads != 0].abs().mean().item():.6e}")
+            else:
+                print("WARNING: Gradients are None! Graph is detached.")
+            self.optimizer.zero_grad()
 
     @torch.no_grad()
     def predict(self, xyz, batch_size=1024):
@@ -224,6 +292,8 @@ class BaseDensityMapper(nn.Module):
         figsize=(10, 8),
         cmap="viridis",
         alpha=0.8,
+        X0=None,                  # Material radiation length to threshold by
+        plot_type="scatter",      # Options: "scatter" or "surface"
     ):
         if points < 2:
             raise ValueError("points must be at least 2")
@@ -254,36 +324,88 @@ class BaseDensityMapper(nn.Module):
         )
 
         xyz = grid.reshape(-1, 3)
-        x,y,z = xyz.unbind(dim=-1)
 
         # Evaluate in batches; results are returned on the CPU.
         values = self.predict(xyz, batch_size=batch_size)
-
-        # Choose marker size based on total point count.
-        n = len(values)
-        marker_size = max(1, min(30, 20000 / n))
+        values = values.flatten()  # Ensure shape is (N,) instead of (N, 1)
 
         fig = plt.figure(figsize=figsize)
         ax = fig.add_subplot(111, projection="3d")
 
-        scatter = ax.scatter(
-            x.numpy(),
-            y.numpy(),
-            z.numpy(),
-            c=values.numpy(),
-            cmap=cmap,
-            s=marker_size,
-            alpha=alpha,
-            linewidths=0,
-        )
+        if plot_type == "scatter":
+            if X0 is not None:
+                lambda_threshold = 1.0 / X0
+                mask = values >= lambda_threshold
+                if mask.sum() == 0:
+                    print(f"Warning: No points found above threshold lambda = {lambda_threshold:.5f} (X0 = {X0})")
+                xyz = xyz[mask]
+                values = values[mask]
 
-        cbar = fig.colorbar(scatter, ax=ax, pad=0.1, shrink=0.75)
-        cbar.set_label(r"Scattering density $\lambda$",fontsize=16)
+            if len(xyz) == 0:
+                print("Plotting skipped: empty point cloud after thresholding.")
+                return fig
 
-        ax.set_xlabel("X",fontsize=16)
-        ax.set_ylabel("Y",fontsize=16)
-        ax.set_zlabel("Z",fontsize=16)
-        ax.set_title("Mapper density")
+            x, y, z = xyz.unbind(dim=-1)
+            n = len(values)
+            marker_size = max(1, min(30, 20000 / n))
+
+            scatter = ax.scatter(
+                x.numpy(),
+                y.numpy(),
+                z.numpy(),
+                c=values.numpy(),
+                cmap=cmap,
+                s=marker_size,
+                alpha=alpha,
+                linewidths=0,
+            )
+            cbar = fig.colorbar(scatter, ax=ax, pad=0.1, shrink=0.75)
+            cbar.set_label(r"Scattering density $\lambda$", fontsize=16)
+
+        elif plot_type == "surface":
+            try:
+                from skimage import measure
+            except ImportError:
+                raise ImportError("Plotting 'surface' requires scikit-image. Run 'pip install scikit-image'.")
+
+            if X0 is None:
+                raise ValueError("plot_type='surface' requires an X0 value to define the isosurface threshold.")
+
+            lambda_threshold = 1.0 / X0
+
+            # Reshape values back to a 3D grid for marching cubes
+            volume = values.numpy().reshape(points, points, points)
+
+            # Scenario B: Clip/mask out low-density background noise below threshold
+            # so unwanted floating artifacts don't form stray meshes.
+            volume_clipped = np.copy(volume)
+            volume_clipped[volume_clipped < lambda_threshold] = 0.0
+
+            try:
+                # Run marching cubes on the clipped volume at the exact threshold level
+                verts, faces, _, _ = measure.marching_cubes(volume_clipped, level=lambda_threshold)
+
+                # Scale vertex coordinates from voxel index space back to physical space [low, high]
+                for i in range(3):
+                    verts[:, i] = low[i].item() + verts[:, i] * (high[i].item() - low[i].item()) / (points - 1)
+
+                mesh = ax.plot_trisurf(
+                    verts[:, 0], verts[:, 1], verts[:, 2],
+                    triangles=faces,
+                    cmap=cmap,
+                    alpha=alpha,
+                    linewidth=0.2,
+                    edgecolor="none"
+                )
+                cbar = fig.colorbar(mesh, ax=ax, pad=0.1, shrink=0.75)
+                cbar.set_label(r"Isosurface at $\lambda = 1/X_0$", fontsize=16)
+            except Exception as e:
+                print(f"Could not generate isosurface (check if threshold exists in volume): {e}")
+
+        ax.set_xlabel("X [m]", fontsize=16)
+        ax.set_ylabel("Y [m]", fontsize=16)
+        ax.set_zlabel("Z [m]", fontsize=16)
+        ax.set_title(f"Mapper density (Filtered X0={X0})" if X0 else "Mapper density")
 
         plt.tight_layout()
         return fig
@@ -299,6 +421,7 @@ class BaseDensityMapper(nn.Module):
         figsize=None,
         cmap="viridis",
         show_materials=True,
+        log=False,
     ):
         if direction not in ("x", "y", "z"):
             raise ValueError("direction must be 'x', 'y', or 'z'")
@@ -376,7 +499,7 @@ class BaseDensityMapper(nn.Module):
             name: lam
             for name, lam in material_lambda.items()
             if lambda_min <= lam <= lambda_max
-        } if show_materials else {}
+        }
 
         # ---------------------------------------------------------
         # Plot the predicted density map.
@@ -402,6 +525,7 @@ class BaseDensityMapper(nn.Module):
             aspect="equal",
             cmap=cmap,
             interpolation="nearest",
+            norm=matplotlib.colors.LogNorm() if log else None,
         )
 
         cbar = fig.colorbar(
@@ -414,28 +538,28 @@ class BaseDensityMapper(nn.Module):
             r"Scattering density $\lambda$ (rad$^2$/m)",
             fontsize=14,
         )
-        formatter = ScalarFormatter(useMathText=True)
+        formatter = ScalarFormatter(useOffset=False)
         formatter.set_scientific(False)
-        cbar.formatter = formatter
+        cbar.formatter = FormatStrFormatter('%.3f')  # 2 decimal places
         cbar.update_ticks()
 
         # ---------------------------------------------------------
         # Overlay material contours and colorbar markers.
         # ---------------------------------------------------------
-        if selected_materials:
-            # Different materials can have nearly identical lambda.
-            # Group numerically identical contour levels.
-            grouped_levels = {}
+        # Different materials can have nearly identical lambda.
+        # Group numerically identical contour levels.
+        grouped_levels = {}
 
-            for name, lam in selected_materials.items():
-                grouped_levels.setdefault(lam, []).append(name)
+        for name, lam in selected_materials.items():
+            grouped_levels.setdefault(lam, []).append(name)
 
-            # Matplotlib requires distinct contour levels.
-            levels = sorted(grouped_levels.keys())
+        # Matplotlib requires distinct contour levels.
+        levels = sorted(grouped_levels.keys())
 
-            if len(levels) >= 1:
-                # Contour only the selected material reference values.
-                # Handle a single level separately for robust plotting.
+        if len(levels) >= 1:
+            # Contour only the selected material reference values.
+            # Handle a single level separately for robust plotting.
+            if show_materials:
                 if len(levels) == 1:
                     lam = levels[0]
 
@@ -458,28 +582,28 @@ class BaseDensityMapper(nn.Module):
                         linewidths=1.5,
                     )
 
-                # Add a black marker to the colorbar for each level.
-                for lam, names in grouped_levels.items():
-                    cbar.ax.plot(
-                        [0, 1],
-                        [lam, lam],
-                        transform=cbar.ax.get_yaxis_transform(),
-                        color="black",
-                        linewidth=2,
-                        clip_on=False,
-                    )
+            # Add a black marker to the colorbar for each level.
+            for lam, names in grouped_levels.items():
+                cbar.ax.plot(
+                    [0, 1],
+                    [lam, lam],
+                    transform=cbar.ax.get_yaxis_transform(),
+                    color="black",
+                    linewidth=2,
+                    clip_on=False,
+                )
 
-                    # Label each marker with its material symbol.
-                    cbar.ax.text(
-                        1.3,
-                        lam,
-                        ", ".join(names),
-                        transform=cbar.ax.get_yaxis_transform(),
-                        va="center",
-                        ha="left",
-                        fontsize=9,
-                        clip_on=False,
-                    )
+                # Label each marker with its material symbol.
+                cbar.ax.text(
+                    1.3,
+                    lam,
+                    ", ".join(names),
+                    transform=cbar.ax.get_yaxis_transform(),
+                    va="center",
+                    ha="left",
+                    fontsize=9,
+                    clip_on=False,
+                )
 
         # ---------------------------------------------------------
         # Axes and formatting.
@@ -500,6 +624,20 @@ class BaseDensityMapper(nn.Module):
         return fig
 
 
+class CustomMapper(BaseDensityMapper):
+    def __init__(
+        self,
+        func,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.func = func
+
+    def forward(self,x):
+        x = self.normalize(x.to(self.device))
+        return self.func(x)
+
+
 class DenseDensityMapper(BaseDensityMapper):
     def __init__(
         self,
@@ -518,7 +656,11 @@ class DenseDensityMapper(BaseDensityMapper):
             output_activation = None,
             batch_norm = batch_norm,
         )
-        self.optimizer = torch.optim.AdamW(self.mlp.parameters(),lr=lr)
+        self.optimizer = torch.optim.AdamW(
+            params = self.mlp.parameters(),
+            lr = lr,
+            betas = (0.5, 0.999),
+        )
         self.set_to_device(self.device)
 
     def forward(self,x):
@@ -614,11 +756,13 @@ class VoxelisedMapper(BaseDensityMapper):
         lr = 1e-2,
         initial_val = 0.0,         # Initial value in normalized space
         alpha_tv = 0.,
+        interpolate = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.resolution = resolution
         self.alpha_tv = alpha_tv
+        self.interpolate = interpolate
 
         # Create learnable 3D voxel parameters of shape (nx, ny, nz)
         # Initialized to initial_val (e.g. 0.0 maps to middle of ylow/yhigh range)
@@ -630,28 +774,18 @@ class VoxelisedMapper(BaseDensityMapper):
         self.raw_voxels = nn.Parameter(raw_voxels)
 
         # Optimizer targeting only the voxel grid
-        self.optimizer = torch.optim.Adam([self.raw_voxels], lr=lr)
+        #self.optimizer = torch.optim.SGD(params = [self.raw_voxels], lr = lr)
+        self.optimizer = torch.optim.AdamW(
+            params = [self.raw_voxels],
+            betas = (0.5, 0.999),
+            lr = lr,
+        )
+
         self.set_to_device(self.device)
 
     @property
     def voxels(self):
-        return torch.pow(10,self.ylow + (self.raw_voxels + 1.) / 2. * (self.yhigh - self.ylow))
-
-    def extra_loss(self):
-        """
-        Computes L1 Total Variation loss on the voxel grid
-        to encourage spatial smoothness and contiguous structures.
-        """
-        # Get the processed density tensor (same range as your forward pass)
-        voxels = torch.tanh(self.raw_voxels)  # Shape: (nx, ny, nz)
-
-        # Calculate absolute differences between adjacent voxels along each axis
-        diff_x = torch.abs(voxels[1:, :, :] - voxels[:-1, :, :]).mean()
-        diff_y = torch.abs(voxels[:, 1:, :] - voxels[:, :-1, :]).mean()
-        diff_z = torch.abs(voxels[:, :, 1:] - voxels[:, :, :-1]).mean()
-
-        # Total TV loss is the sum of variations across all three dimensions
-        return self.alpha_tv * (diff_x + diff_y + diff_z)
+        return torch.pow(10, self.ylow + (self.raw_voxels + 1.) / 2. * (self.yhigh - self.ylow))
 
     def forward(self, x):
         """
@@ -680,9 +814,107 @@ class VoxelisedMapper(BaseDensityMapper):
         sampled = F.grid_sample(
             voxels,
             grid,
-            mode='bilinear',          # In PyTorch, 3D mode='bilinear' executes trilinear interpolation
+            mode='bilinear' if self.interpolate else 'nearest',
             padding_mode='border',
             align_corners=True
         )
         # sampled shape: (1, 1, 1, 1, B) -> reshape to (B, 1)
         return sampled.view(-1, 1)
+
+
+class HashGridDensityMapper(BaseDensityMapper):
+    """
+    Multi-resolution feature grid mapper (NeRF / Instant-NGP style)
+    adapted for muon tomography. Uses local multi-scale features + a tiny decoder MLP
+    to provide continuous, localized updates without global gradient interference.
+    """
+    def __init__(
+        self,
+        feature_dim,
+        resolutions = [16, 32, 64],
+        neurons = [32],
+        activation = nn.GELU,
+        lr = 1e-2,
+        interpolate = False,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.feature_dim = feature_dim
+        self.resolutions = resolutions
+        self.interpolate = interpolate
+
+        # 1. Multi-resolution feature grids
+        self.grids = nn.ParameterList([
+            nn.Parameter(torch.randn(1, self.feature_dim, res, res, res) * 0.01)
+            for res in resolutions
+        ])
+
+        # 2. Tiny local decoder MLP
+        self.decoder = MLP(
+            dim_in = self.feature_dim * len(resolutions),
+            dim_out = 1,
+            neurons = neurons,
+            hidden_activation = activation,
+            output_activation = None,
+        )
+        # Optimizer targeting both the multi-res grids and the tiny decoder
+        self.optimizer = torch.optim.Adam(
+            params = list(self.parameters()),
+            lr = lr,
+            betas = (0.5, 0.999),
+        )
+        self.set_to_device(self.device)
+
+    def forward(self, x):
+        """
+        x: Tensor of shape (batch_size, 3) containing spatial coordinates (x, y, z)
+        returns: Tensor of shape (batch_size, 1) in range [-1, 1] expected by process()
+        """
+        x = x.to(self.device)
+        # Normalize spatial coordinates to [-1, 1] for grid_sample
+        x_norm = self.normalize(x)
+        # grid_sample expects coordinates of shape (N, D_out, H_out, W_out, 3) -> (1, 1, 1, B, 3)
+        grid_coords = x_norm.view(1, 1, 1, -1, 3)
+        level_features = []
+        # Sample features from each multi-resolution grid level
+        for grid in self.grids:
+            # Sample using trilinear interpolation ('bilinear' mode in 3D grid_sample)
+            sampled = F.grid_sample(
+                grid,
+                grid_coords,
+                mode = 'bilinear' if self.interpolate else 'nearest',
+                padding_mode = 'border',
+                align_corners = True
+            )
+            # sampled shape: (1, feature_dim, 1, 1, B) -> reshape to (B, feature_dim)
+            feat = sampled.permute(4, 1, 2, 3, 0).reshape(x.shape[0], self.feature_dim)
+            level_features.append(feat)
+        # Concatenate features from all resolutions: shape (B, total_feat_dim)
+        multi_scale_features = torch.cat(level_features, dim=-1)
+        # Pass through tiny local decoder MLP to get raw density value in [-1, 1]
+        raw_density = self.decoder(multi_scale_features)
+        return raw_density
+
+    def print_global_resolution_importance(self):
+        # Find the first linear layer in the decoder MLP
+        first_linear = None
+        for layer in self.decoder.modules():
+            if isinstance(layer, nn.Linear):
+                first_linear = layer
+                break
+
+        if first_linear is None:
+            print("No linear layer found in decoder.")
+            return
+
+        weight = first_linear.weight.detach().abs() # Shape: (out_features, total_feat_dim)
+
+        print("\n--- Global Resolution Importance (MLP First-Layer Weight Norms) ---")
+        for idx, res in enumerate(self.resolutions):
+            start_col = idx * self.feature_dim
+            end_col = (idx + 1) * self.feature_dim
+
+            # Sum or L2 norm of the weights connected to this specific resolution's feature channels
+            level_weight_score = weight[:, start_col:end_col].sum().item()
+            print(f"Resolution {res:3d}x{res}x{res} (Level {idx}): Importance Score = {level_weight_score:.4f}")
+        print("--------------------------------------------------------------------\n")

@@ -31,7 +31,7 @@ class Callback(ABC):
         """Called at the end of an iteration, respecting frequency."""
         pass
 
-    def on_losses_end(self, iteration: int, losses: dict):
+    def on_losses_end(self, iteration: int, losses: dict, lr: float):
         """Called at the end of an iteration, respecting frequency."""
         pass
 
@@ -45,25 +45,27 @@ class Callback(ABC):
 
     def should_run(self, iteration: int) -> bool:
         """Determine whether the callback should run at this iteration."""
-        return iteration % self.frequency == 0
+        return iteration > 0 and iteration % self.frequency == 0
 
     def plot(self,iteration: int) -> None:
         pass
 
 class LossPlotCallback(Callback):
-    def __init__(self,log=False,**kwargs):
-        self.log = log
+    def __init__(self,scale='linear',**kwargs):
+        self.scale = scale
         super().__init__(**kwargs)
 
     def on_optimisation_start(self,mapper):
         self.iterations = []
+        self.lrs = []
         self.losses = {}
 
     def on_optimisation_end(self,mapper):
         self.plot()
 
-    def on_losses_end(self, iteration: int, losses: dict):
+    def on_losses_end(self, iteration: int, losses: dict, lr: float):
         self.iterations.append(iteration)
+        self.lrs.append(lr)
         for key,val in losses.items():
             if key not in self.losses.keys():
                 self.losses[key] = [val]
@@ -73,24 +75,38 @@ class LossPlotCallback(Callback):
 
     def plot(self,iteration=None):
         if iteration is None or self.should_run(iteration):
-            fig = plt.figure()
+            fig,ax1 = plt.subplots()
+            ax2 = ax1.twinx()
             for name,values in self.losses.items():
-                plt.plot(
+                ax1.plot(
                     self.iterations,
                     values,
                     label = name,
                 )
-            plt.xlabel('Iterations')
-            plt.legend()
-            if self.log:
-                plt.yscale('log')
+            ax2.plot(
+                self.iterations,
+                self.lrs,
+                linestyle = 'dashed',
+                color = 'black',
+            )
+            ax1.set_xlabel('Iterations',fontsize=14)
+            ax1.set_ylabel('Losses',fontsize=14)
+            ax2.set_ylabel('LR',fontsize=14)
+            ax1.set_yscale(self.scale) #,linthresh=1)
+            ax2.set_yscale('log')
+            ax1.legend()
             plt.show()
 
 class MapperPlotCallback(Callback):
-    def __init__(self,low,high,**kwargs):
+    def __init__(self,low,high,points=50,xs=[],ys=[],zs=[],log=False,**kwargs):
         super().__init__(**kwargs)
         self.low = low
         self.high = high
+        self.xs = xs
+        self.ys = ys
+        self.zs = zs
+        self.points = points
+        self.log = log
 
     def on_optimisation_end(self,mapper):
         self.plot(None,mapper)
@@ -100,27 +116,39 @@ class MapperPlotCallback(Callback):
 
     def plot(self,iteration,mapper):
         if iteration is None or self.should_run(iteration):
-            for value in [1.0,3.5,6.0]:
+            for x in self.xs:
+                fig = mapper.plot_slice(
+                    direction = 'x',
+                    value = x,
+                    low = [self.low[1],self.low[2]],
+                    high = [self.high[1],self.high[2]],
+                    batch_size = 5000,
+                    points = self.points,
+                    show_materials = False,
+                    log = self.log,
+                )
+            for y in self.ys:
                 fig = mapper.plot_slice(
                     direction = 'y',
-                    value = value,
+                    value = y,
                     low = [self.low[0],self.low[2]],
                     high = [self.high[0],self.high[2]],
                     batch_size = 5000,
-                    points = 50,
-                    show_materials = True,
+                    points = self.points,
+                    show_materials = False,
+                    log = self.log,
                 )
-            for value in [1.0,2.0,3.0]:
+            for z in self.zs:
                 fig = mapper.plot_slice(
                     direction = 'z',
-                    value = value,
+                    value = z,
                     low = [self.low[0],self.low[1]],
                     high = [self.high[0],self.high[1]],
                     batch_size = 5000,
-                    points = 50,
-                    show_materials = True,
+                    points = self.points,
+                    show_materials = False,
+                    log = self.log,
                 )
-
             plt.show()
 
 class ObservablesPlotCallback(Callback):
