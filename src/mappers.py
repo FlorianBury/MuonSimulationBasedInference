@@ -239,21 +239,21 @@ class BaseDensityMapper(nn.Module):
         if self.accumulation is not None and self.accumulation > 1:
             loss = loss / self.accumulation
         loss.backward()
-        self.param_stats()
+        #self.param_stats()
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
         self._counter += 1
 
         if self.accumulation is None or (self._counter % self.accumulation == 0):
             self.optimizer.step()
-            if self.raw_voxels.grad is not None:
-                print(f"Max gradient: {self.raw_voxels.grad.abs().max().item():.6e}")
-                grads = self.raw_voxels.grad
-                num_total = grads.numel()
-                num_nonzero = (grads != 0).sum().item()
-                print(f"Non-zero gradients: {num_nonzero} out of {num_total} voxels ({num_nonzero / num_total * 100:.2f}%)")
-                print(f"Mean gradient of active voxels: {grads[grads != 0].abs().mean().item():.6e}")
-            else:
-                print("WARNING: Gradients are None! Graph is detached.")
+            #if self.raw_voxels.grad is not None:
+            #    print(f"Max gradient: {self.raw_voxels.grad.abs().max().item():.6e}")
+            #    grads = self.raw_voxels.grad
+            #    num_total = grads.numel()
+            #    num_nonzero = (grads != 0).sum().item()
+            #    print(f"Non-zero gradients: {num_nonzero} out of {num_total} voxels ({num_nonzero / num_total * 100:.2f}%)")
+            #    print(f"Mean gradient of active voxels: {grads[grads != 0].abs().mean().item():.6e}")
+            #else:
+            #    print("WARNING: Gradients are None! Graph is detached.")
             self.optimizer.zero_grad()
 
     @torch.no_grad()

@@ -31,6 +31,7 @@ class BasePropagator:
         ri,
         di,
         pi,
+        idx = None,
         eps = 1e-12,
     ):
         assert self.low is not None
@@ -48,9 +49,9 @@ class BasePropagator:
         active = torch.arange(N)
 
         if self.noise is not None:
+            assert idx is not None
             assert self.noise.shape[0] > N, f'{self.noise.shape[0]} vs {N}'
-            noise = self.noise[:N]
-        print ('using',noise.shape)
+            noise = self.noise[idx]
 
         next_progress = 1
         progress_bar = ""
@@ -58,7 +59,7 @@ class BasePropagator:
         while active.numel() > 0:
             # select still active muons
             x, t, p = pos[active], vec[active], mom[active]
-            z = noise[:,counter][active] if noise is not None else None
+            z = noise[:,counter][active] if self.noise is not None else None
             # Scattering over one step
             x_new, t_new, p_new = self.propagate_step(
                 lam = mapper.process(x).cpu() + eps,
